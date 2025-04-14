@@ -355,11 +355,11 @@ def main():
         if st.session_state.portfolio:
             st.subheader("Your Portfolio")
             total_value = sum([h['value'] for h in st.session_state.portfolio.values() if h['data'] is not None])
-            st.metric("Total Value", f"${total_value:,.2f}" if total_value > 0 else "$0")
+            st.metric("Total Value", f"₹{total_value:,.2f}" if total_value > 0 else "₹0")
             
             for ticker, holding in st.session_state.portfolio.items():
                 if holding['data'] is not None:
-                    st.markdown(f"**{ticker}**: {holding['quantity']} shares (${holding['value']:,.2f})")
+                    st.markdown(f"**{ticker}**: {holding['quantity']} shares (₹{holding['value']:,.2f})")
 
     # Main content area
     st.title("📊 AI Portfolio Manager Pro+")
@@ -505,7 +505,7 @@ def main():
                     with cols[i % 3]:
                         st.metric(
                             metric,
-                            f"${data['value']/1e6:,.1f}M" if data['value'] > 1e6 else f"${data['value']:,.0f}",
+                            f"₹{data['value']/1e6:,.1f}M" if data['value'] > 1e6 else f"₹{data['value']:,.0f}",
                             data['status'].capitalize()
                         )
             
