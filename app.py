@@ -21,6 +21,7 @@ from sklearn.cluster import KMeans
 from sklearn.neural_network import MLPRegressor
 from tensorflow.keras.models import Sequential
 from tensorflow.keras.layers import LSTM, Dense
+import scipy.cluster.hierarchy as sch
 import warnings
 warnings.filterwarnings('ignore')
 
@@ -92,6 +93,14 @@ st.markdown("""
     
     .efficient-frontier-container {
         height: 500px;
+    }
+    
+    .suggestion-card {
+        background-color: #f8f9fa;
+        border-radius: 8px;
+        padding: 15px;
+        margin-bottom: 10px;
+        border-left: 4px solid var(--info);
     }
 </style>
 """, unsafe_allow_html=True)
@@ -339,13 +348,23 @@ def mean_variance_optimization(returns, cov_matrix, target_return=None, risk_fre
 
 def risk_parity_allocation(cov_matrix):
     """Calculate risk parity allocation"""
+    if cov_matrix is None or cov_matrix.empty:
+        return None
+    
+    # Convert DataFrame to numpy array if needed
+    if isinstance(cov_matrix, pd.DataFrame):
+        cov_matrix = cov_matrix.values
+    
     n = cov_matrix.shape[0]
     weights = cp.Variable(n)
     risk_contributions = []
     
+    portfolio_variance = cp.quad_form(weights, cov_matrix)
+    
     for i in range(n):
-        rc = weights[i] * (cov_matrix @ weights)[i] / cp.quad_form(weights, cov_matrix)
-        risk_contributions.append(rc)
+        marginal_risk = cov_matrix[i, :] @ weights
+        risk_contribution = weights[i] * marginal_risk / portfolio_variance
+        risk_contributions.append(risk_contribution)
     
     objective = cp.Minimize(cp.sum_squares(cp.hstack(risk_contributions) - 1/n))
     constraints = [cp.sum(weights) == 1, weights >= 0]
@@ -356,6 +375,9 @@ def risk_parity_allocation(cov_matrix):
 
 def hierarchical_risk_parity(cov_matrix):
     """Hierarchical Risk Parity allocation"""
+    if cov_matrix is None or cov_matrix.empty:
+        return None
+    
     # Step 1: Hierarchical clustering
     corr_matrix = cov_to_corr(cov_matrix)
     dist_matrix = np.sqrt((1 - corr_matrix) / 2)
@@ -364,10 +386,17 @@ def hierarchical_risk_parity(cov_matrix):
     # Step 2: Quasi-diagonalization
     linkage = sch.linkage(dist_matrix, method='single')
     sort_idx = sch.dendrogram(linkage, no_plot=True)['leaves']
-    sorted_corr = corr_matrix.iloc[sort_idx, sort_idx]
+    
+    # For DataFrame input
+    if isinstance(corr_matrix, pd.DataFrame):
+        sorted_corr = corr_matrix.iloc[sort_idx, sort_idx]
+        tickers = corr_matrix.index[sort_idx]
+    else:
+        sorted_corr = corr_matrix[sort_idx, :][:, sort_idx]
+        tickers = np.arange(corr_matrix.shape[0])[sort_idx]
     
     # Step 3: Recursive bisection
-    weights = pd.Series(1, index=sorted_corr.index)
+    weights = pd.Series(1, index=tickers)
     clusters = [weights.index]
     
     while len(clusters) > 0:
@@ -380,8 +409,12 @@ def hierarchical_risk_parity(cov_matrix):
         sub_cluster2 = cluster[len(cluster)//2:]
         
         # Allocate weights based on inverse variance
-        var1 = cov_matrix.loc[sub_cluster1, sub_cluster1].mean().mean()
-        var2 = cov_matrix.loc[sub_cluster2, sub_cluster2].mean().mean()
+        if isinstance(cov_matrix, pd.DataFrame):
+            var1 = cov_matrix.loc[sub_cluster1, sub_cluster1].values.mean()
+            var2 = cov_matrix.loc[sub_cluster2, sub_cluster2].values.mean()
+        else:
+            var1 = cov_matrix[sub_cluster1, :][:, sub_cluster1].mean()
+            var2 = cov_matrix[sub_cluster2, :][:, sub_cluster2].mean()
         
         total_var = var1 + var2
         alpha = 1 - var1 / total_var
@@ -395,11 +428,16 @@ def hierarchical_risk_parity(cov_matrix):
 
 def cov_to_corr(cov_matrix):
     """Convert covariance matrix to correlation matrix"""
-    std = np.sqrt(np.diag(cov_matrix))
-    corr = cov_matrix / np.outer(std, std)
+    if isinstance(cov_matrix, pd.DataFrame):
+        std = np.sqrt(np.diag(cov_matrix))
+        corr = cov_matrix / np.outer(std, std)
+    else:
+        std = np.sqrt(np.diag(cov_matrix))
+        corr = cov_matrix / np.outer(std, std)
+    
     corr[corr < -1] = -1
     corr[corr > 1] = 1
-    return pd.DataFrame(corr, index=cov_matrix.index, columns=cov_matrix.columns)
+    return corr
 
 def black_litterman(returns, cov_matrix, tau=0.05, views=None, P=None, Q=None):
     """Black-Litterman model for incorporating views"""
@@ -422,11 +460,99 @@ def black_litterman(returns, cov_matrix, tau=0.05, views=None, P=None, Q=None):
     
     return new_returns
 
+def generate_actionable_suggestions(portfolio, portfolio_metrics, ai_output):
+    """Generate specific, actionable investment suggestions"""
+    suggestions = []
+    
+    # Portfolio-level suggestions
+    if portfolio_metrics['health_score'] < 70:
+        suggestions.append({
+            'title': 'Improve Portfolio Health Score',
+            'actions': [
+                'Rebalance portfolio to reduce concentration risk',
+                'Add defensive assets to lower overall beta',
+                'Consider value stocks to improve valuation metrics'
+            ],
+            'priority': 'High'
+        })
+    
+    if portfolio_metrics['total_beta'] > 1.2:
+        suggestions.append({
+            'title': 'Reduce Portfolio Risk',
+            'actions': [
+                'Add low-beta stocks (e.g., utilities, consumer staples)',
+                'Consider adding bonds or gold for diversification',
+                'Implement hedging strategies with options'
+            ],
+            'priority': 'High'
+        })
+    elif portfolio_metrics['total_beta'] < 0.8:
+        suggestions.append({
+            'title': 'Increase Market Exposure',
+            'actions': [
+                'Add high-beta stocks (e.g., technology, small caps)',
+                'Reduce cash positions',
+                'Consider leveraged ETFs for targeted exposure'
+            ],
+            'priority': 'Medium'
+        })
+    
+    # Sector concentration suggestions
+    if len(portfolio_metrics['sector_exposure']) < 3:
+        main_sector = max(portfolio_metrics['sector_exposure'], key=portfolio_metrics['sector_exposure'].get)
+        suggestions.append({
+            'title': f'Diversify Away from {main_sector}',
+            'actions': [
+                f'Reduce exposure to {main_sector} sector',
+                'Add exposure to underrepresented sectors',
+                'Consider sector ETFs for broad diversification'
+            ],
+            'priority': 'Medium'
+        })
+    
+    # Stock-specific suggestions from AI output
+    for ticker, report_card in ai_output['report_cards'].items():
+        ticker_suggestions = []
+        
+        # Valuation suggestions
+        if report_card['valuation']['P/E']['status'] == 'high':
+            ticker_suggestions.append(f'Consider reducing position in {ticker} due to high P/E')
+        elif report_card['valuation']['P/E']['status'] == 'low':
+            ticker_suggestions.append(f'Potential buying opportunity in {ticker} with low P/E')
+        
+        # Technical suggestions
+        if 'RSI' in report_card['technical']:
+            if report_card['technical']['RSI']['status'] == 'high':
+                ticker_suggestions.append(f'{ticker} appears overbought (RSI > 70) - consider profit taking')
+            elif report_card['technical']['RSI']['status'] == 'low':
+                ticker_suggestions.append(f'{ticker} appears oversold (RSI < 30) - potential buying opportunity')
+        
+        if ticker_suggestions:
+            suggestions.append({
+                'title': f'{ticker} Specific Actions',
+                'actions': ticker_suggestions,
+                'priority': 'Medium'
+            })
+    
+    # Risk management suggestions
+    var_95 = calculate_var(portfolio_metrics['returns_data'].mean(axis=1), 'historical', 0.95)
+    if var_95 and var_95 < -0.05:  # More than 5% daily VaR
+        suggestions.append({
+            'title': 'High Portfolio Risk Detected',
+            'actions': [
+                'Reduce positions in highest volatility assets',
+                'Implement stop-loss orders',
+                'Consider protective puts on key positions'
+            ],
+            'priority': 'High'
+        })
+    
+    return suggestions
+
 def generate_ai_insights(portfolio, portfolio_metrics):
     """Generate AI-powered insights based on the data"""
     insights = []
     warnings = []
-    suggestions = []
     report_cards = {}
     
     # Portfolio-level insights
@@ -507,7 +633,7 @@ def generate_ai_insights(portfolio, portfolio_metrics):
         
         report_cards[ticker] = report_card
         
-        # Generate warnings and suggestions based on report card
+        # Generate warnings based on report card
         if pe > 30 and pe > info.get('industryPE', 100):
             warnings.append(f"⚠️ {ticker}: High P/E ratio ({pe:.1f}) compared to industry")
         
@@ -515,12 +641,14 @@ def generate_ai_insights(portfolio, portfolio_metrics):
             warnings.append(f"⚠️ {ticker}: High debt-to-equity ratio ({de:.2f})")
         
         if 'RSI' in report_card['technical'] and report_card['technical']['RSI']['status'] == 'high':
-            warnings.append(f"⚠️ {ticker}: Overbought (RSI = {report_card['technical']['RSI']['value']:.1f}) - Consider profit booking")
-        
-        if 'MA_50' in hist.columns and 'MA_200' in hist.columns:
-            if len(hist) >= 2:
-                if hist['MA_50'].iloc[-1] < hist['MA_200'].iloc[-1] and hist['MA_50'].iloc[-2] >= hist['MA_200'].iloc[-2]:
-                    suggestions.append(f"🔴 Consider exiting {ticker} - Death Cross detected (50MA crossed below 200MA)")
+            warnings.append(f"⚠️ {ticker}: Overbought (RSI = {report_card['technical']['RSI']['value']:.1f})")
+    
+    # Generate actionable suggestions
+    suggestions = generate_actionable_suggestions(portfolio, portfolio_metrics, {
+        'report_cards': report_cards,
+        'insights': insights,
+        'warnings': warnings
+    })
     
     return {
         'insights': insights,
@@ -531,7 +659,6 @@ def generate_ai_insights(portfolio, portfolio_metrics):
 
 def get_news_sentiment(ticker):
     """Optional: Get news sentiment for a stock"""
-    # This is a placeholder - you would integrate with a news API
     return {
         'sentiment': 'neutral',
         'summary': 'No major news events recently'
@@ -649,7 +776,7 @@ def display_portfolio_optimization(portfolio_metrics):
     """Display portfolio optimization tools"""
     st.subheader("⚙️ Portfolio Optimization", divider="blue")
     
-    if portfolio_metrics['returns_data'] is None:
+    if portfolio_metrics['returns_data'] is None or portfolio_metrics['cov_matrix'] is None:
         st.warning("Insufficient data for portfolio optimization")
         return
     
@@ -669,7 +796,7 @@ def display_portfolio_optimization(portfolio_metrics):
                                 value=10.0, 
                                 step=0.5) / 100
         
-        opt_weights = mean_variance_optimization(mean_returns, cov_matrix, target_return)
+        opt_weights = mean_variance_optimization(mean_returns, cov_matrix.values, target_return)
         
         if opt_weights is not None:
             opt_df = pd.DataFrame({
@@ -747,8 +874,8 @@ def display_portfolio_optimization(portfolio_metrics):
             P[i, tickers.index(ticker)] = 1
         
         if st.button("Optimize with Views"):
-            bl_returns = black_litterman(mean_returns, cov_matrix, views=view_tickers, P=P, Q=Q)
-            opt_weights = mean_variance_optimization(bl_returns, cov_matrix)
+            bl_returns = black_litterman(mean_returns.values, cov_matrix.values, views=view_tickers, P=P, Q=Q)
+            opt_weights = mean_variance_optimization(bl_returns, cov_matrix.values)
             
             if opt_weights is not None:
                 opt_df = pd.DataFrame({
@@ -775,7 +902,7 @@ def display_portfolio_optimization(portfolio_metrics):
     
     with tab3:
         st.markdown("#### Risk Parity Allocation")
-        rp_weights = risk_parity_allocation(cov_matrix)
+        rp_weights = risk_parity_allocation(cov_matrix.values)
         
         if rp_weights is not None:
             rp_df = pd.DataFrame({
@@ -974,6 +1101,43 @@ def display_advanced_analytics(portfolio_metrics):
         - Use tax-advantaged accounts where possible
         """)
 
+def display_actionable_suggestions(suggestions):
+    """Display actionable suggestions in a structured way"""
+    st.subheader("🚀 Actionable Suggestions", divider="blue")
+    
+    if not suggestions:
+        st.info("No specific suggestions at this time. Your portfolio appears well-balanced.")
+        return
+    
+    # Group by priority
+    high_priority = [s for s in suggestions if s['priority'] == 'High']
+    medium_priority = [s for s in suggestions if s['priority'] == 'Medium']
+    low_priority = [s for s in suggestions if s['priority'] == 'Low']
+    
+    if high_priority:
+        st.markdown("### 🔴 High Priority Actions")
+        for suggestion in high_priority:
+            with st.expander(f"📌 {suggestion['title']}"):
+                st.markdown("**Recommended Actions:**")
+                for action in suggestion['actions']:
+                    st.markdown(f"- {action}")
+    
+    if medium_priority:
+        st.markdown("### 🟡 Medium Priority Actions")
+        for suggestion in medium_priority:
+            with st.expander(f"📌 {suggestion['title']}"):
+                st.markdown("**Recommended Actions:**")
+                for action in suggestion['actions']:
+                    st.markdown(f"- {action}")
+    
+    if low_priority:
+        st.markdown("### 🟢 Low Priority Actions")
+        for suggestion in low_priority:
+            with st.expander(f"📌 {suggestion['title']}"):
+                st.markdown("**Recommended Actions:**")
+                for action in suggestion['actions']:
+                    st.markdown(f"- {action}")
+
 # Main app
 def main():
     # Initialize session state
@@ -1058,18 +1222,13 @@ def main():
     # AI Insights Section
     st.subheader("🤖 AI Insights", divider="blue")
     
-    if ai_output['insights'] or ai_output['suggestions']:
-        tab1, tab2 = st.tabs(["Market Insights", "Actionable Suggestions"])
-        
-        with tab1:
-            for insight in ai_output['insights']:
-                st.info(insight)
-        
-        with tab2:
-            for suggestion in ai_output['suggestions']:
-                st.success(suggestion)
-    else:
-        st.info("No specific insights or suggestions at this time")
+    if ai_output['insights']:
+        st.info("### Market Insights")
+        for insight in ai_output['insights']:
+            st.write(f"- {insight}")
+    
+    # Display actionable suggestions
+    display_actionable_suggestions(ai_output['suggestions'])
     
     # Portfolio Composition
     st.subheader("🧩 Portfolio Composition", divider="blue")
