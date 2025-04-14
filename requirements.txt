@@ -8,5 +8,4 @@ plotly
 scikit-learn
 openpyxl
 statsmodels
-cvxpy
-networkx
+tensorflow
