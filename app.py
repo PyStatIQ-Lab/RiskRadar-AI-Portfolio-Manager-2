@@ -6,7 +6,9 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 from sklearn.ensemble import IsolationForest
 from sklearn.preprocessing import StandardScaler
-import openpyxl  # For Excel support
+import openpyxl
+import os
+import plotly.express as px
 
 # Configure page
 st.set_page_config(
@@ -16,7 +18,7 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
-# Custom CSS for professional look
+# Custom CSS
 st.markdown("""
 <style>
     :root {
@@ -93,12 +95,13 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 # Helper functions
-def load_stock_list(file_path):
+def load_stock_list(file_path="stocks.xlsx"):
     """Load stock symbols from Excel file"""
     try:
-        df = pd.read_excel(file_path, engine='openpyxl')
-        if 'Symbol' in df.columns:
-            return df['Symbol'].unique().tolist()
+        if os.path.exists(file_path):
+            df = pd.read_excel(file_path, engine='openpyxl')
+            if 'Symbol' in df.columns:
+                return df['Symbol'].dropna().unique().tolist()
         return []
     except Exception as e:
         st.error(f"Error loading stock list: {str(e)}")
@@ -110,6 +113,10 @@ def get_stock_data(ticker):
         stock = yf.Ticker(ticker)
         info = stock.info
         hist = stock.history(period="1y")
+        
+        if hist.empty:
+            return None
+            
         return {'info': info, 'history': hist}
     except Exception as e:
         st.error(f"Error fetching data for {ticker}: {str(e)}")
@@ -117,15 +124,21 @@ def get_stock_data(ticker):
 
 def calculate_technical_indicators(df):
     """Calculate technical indicators from historical data"""
-    df['MA_50'] = df['Close'].rolling(window=50).mean()
-    df['MA_200'] = df['Close'].rolling(window=200).mean()
+    if df.empty:
+        return df
+        
+    df['MA_50'] = df['Close'].rolling(window=50, min_periods=1).mean()
+    df['MA_200'] = df['Close'].rolling(window=200, min_periods=1).mean()
     
-    # Calculate RSI
-    delta = df['Close'].diff()
-    gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
-    loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
-    rs = gain / loss
-    df['RSI'] = 100 - (100 / (1 + rs))
+    # Calculate RSI only if we have enough data
+    if len(df) >= 14:
+        delta = df['Close'].diff()
+        gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
+        loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
+        rs = gain / loss
+        df['RSI'] = 100 - (100 / (1 + rs))
+    else:
+        df['RSI'] = np.nan
     
     return df
 
@@ -146,6 +159,9 @@ def calculate_portfolio_metrics(portfolio):
     total_value = sum([h['value'] for h in portfolio.values()])
     
     for ticker, holding in portfolio.items():
+        if holding['data'] is None:
+            continue
+            
         weight = holding['value'] / total_value if total_value > 0 else 0
         metrics['individual_weights'][ticker] = weight
         
@@ -192,6 +208,10 @@ def generate_ai_insights(portfolio, portfolio_metrics):
     
     # Stock-specific analysis
     for ticker, holding in portfolio.items():
+        if holding['data'] is None:
+            warnings.append(f"⚠️ Could not fetch data for {ticker}")
+            continue
+            
         info = holding['data']['info']
         hist = holding['data']['history']
         
@@ -203,16 +223,19 @@ def generate_ai_insights(portfolio, portfolio_metrics):
         if info.get('debtToEquity', 0) > 1.5:
             warnings.append(f"⚠️ {ticker}: High debt-to-equity ratio ({info.get('debtToEquity', 0):.2f})")
         
-        # Technical analysis signals
-        last_rsi = hist['RSI'].iloc[-1]
-        if last_rsi > 70:
-            warnings.append(f"⚠️ {ticker}: Overbought (RSI = {last_rsi:.1f}) - Consider profit booking")
-        elif last_rsi < 30:
-            insights.append(f"🟢 {ticker}: Oversold (RSI = {last_rsi:.1f}) - Potential buying opportunity")
+        # Technical analysis signals (only if RSI exists)
+        if 'RSI' in hist.columns and not pd.isna(hist['RSI'].iloc[-1]):
+            last_rsi = hist['RSI'].iloc[-1]
+            if last_rsi > 70:
+                warnings.append(f"⚠️ {ticker}: Overbought (RSI = {last_rsi:.1f}) - Consider profit booking")
+            elif last_rsi < 30:
+                insights.append(f"🟢 {ticker}: Oversold (RSI = {last_rsi:.1f}) - Potential buying opportunity")
         
         # Exit signal based on moving averages
-        if hist['MA_50'].iloc[-1] < hist['MA_200'].iloc[-1] and hist['MA_50'].iloc[-2] >= hist['MA_200'].iloc[-2]:
-            suggestions.append(f"🔴 Consider exiting {ticker} - Death Cross detected (50MA crossed below 200MA)")
+        if 'MA_50' in hist.columns and 'MA_200' in hist.columns:
+            if len(hist) >= 2:
+                if hist['MA_50'].iloc[-1] < hist['MA_200'].iloc[-1] and hist['MA_50'].iloc[-2] >= hist['MA_200'].iloc[-2]:
+                    suggestions.append(f"🔴 Consider exiting {ticker} - Death Cross detected (50MA crossed below 200MA)")
     
     return {
         'insights': insights,
@@ -226,7 +249,12 @@ def detect_anomalies(portfolio):
     tickers = []
     
     for ticker, holding in portfolio.items():
+        if holding['data'] is None:
+            continue
+            
         info = holding['data']['info']
+        hist = holding['data']['history']
+        
         features.append([
             info.get('beta', 0),
             info.get('trailingPE', 0),
@@ -235,11 +263,11 @@ def detect_anomalies(portfolio):
             info.get('currentRatio', 0),
             info.get('quickRatio', 0),
             info.get('priceToBook', 0),
-            holding['data']['history']['Close'].pct_change().std() * np.sqrt(252)  # Annualized volatility
+            hist['Close'].pct_change().std() * np.sqrt(252) if not hist.empty else 0
         ])
         tickers.append(ticker)
     
-    if not features:
+    if not features or len(features) < 2:
         return {}
     
     # Scale features
@@ -259,45 +287,19 @@ def detect_anomalies(portfolio):
     
     return anomalies
 
-def display_stock_card(ticker, holding):
-    """Display a card with stock information"""
-    info = holding['data']['info']
-    hist = holding['data']['history']
-    
-    with st.container():
-        col1, col2, col3 = st.columns([2, 1, 1])
-        
-        with col1:
-            st.markdown(f"**{ticker}** - {info.get('shortName', '')}")
-            st.caption(f"{info.get('sector', 'N/A')} | {info.get('industry', 'N/A')}")
-            
-        with col2:
-            current_price = info.get('currentPrice', info.get('regularMarketPrice', 0))
-            st.metric("Current Price", f"${current_price:,.2f}" if current_price else "N/A")
-            
-        with col3:
-            day_change = info.get('regularMarketChangePercent', 0)
-            change_color = "red" if day_change < 0 else "green"
-            st.metric("Daily Change", f"{day_change:.2f}%", delta_color="off", 
-                     help="Daily percentage change")
-
 # Main app
 def main():
+    # Initialize session state
+    if 'portfolio' not in st.session_state:
+        st.session_state.portfolio = {}
+    
+    # Load stock list from Excel
+    stock_list = load_stock_list()
+    
     # Sidebar for user input
     with st.sidebar:
         st.image("https://via.placeholder.com/200x50?text=Portfolio+Pro", use_column_width=True)
         st.header("Portfolio Setup")
-        
-        # Upload stock list
-        uploaded_file = st.file_uploader("Upload stocks.xlsx", type=["xlsx"])
-        if uploaded_file:
-            stock_list = load_stock_list(uploaded_file)
-        else:
-            stock_list = []
-        
-        # Initialize session state for portfolio
-        if 'portfolio' not in st.session_state:
-            st.session_state.portfolio = {}
         
         # Stock selection and quantity input
         if stock_list:
@@ -308,7 +310,8 @@ def main():
                 with st.spinner(f"Fetching data for {selected_stock}..."):
                     stock_data = get_stock_data(selected_stock)
                     if stock_data:
-                        current_price = stock_data['info'].get('currentPrice', stock_data['info'].get('regularMarketPrice', 0))
+                        current_price = stock_data['info'].get('currentPrice', 
+                                             stock_data['info'].get('regularMarketPrice', 0))
                         value = current_price * quantity
                         st.session_state.portfolio[selected_stock] = {
                             'quantity': quantity,
@@ -316,15 +319,19 @@ def main():
                             'data': stock_data
                         }
                         st.success(f"Added {quantity} shares of {selected_stock} to portfolio")
+                    else:
+                        st.error(f"Failed to fetch data for {selected_stock}")
         
         # Portfolio summary in sidebar
         if st.session_state.portfolio:
             st.subheader("Your Portfolio")
-            total_value = sum([h['value'] for h in st.session_state.portfolio.values()])
-            st.metric("Total Value", f"${total_value:,.2f}")
+            total_value = sum([h['value'] for h in st.session_state.portfolio.values() 
+                              if h['data'] is not None])
+            st.metric("Total Value", f"${total_value:,.2f}" if total_value > 0 else "$0")
             
             for ticker, holding in st.session_state.portfolio.items():
-                st.markdown(f"**{ticker}**: {holding['quantity']} shares (${holding['value']:,.2f})")
+                if holding['data'] is not None:
+                    st.markdown(f"**{ticker}**: {holding['quantity']} shares (${holding['value']:,.2f})")
 
     # Main content area
     st.title("AI Portfolio Manager Pro")
@@ -350,8 +357,7 @@ def main():
     with col2:
         beta_color = "red" if portfolio_metrics['total_beta'] > 1.2 else "green" if portfolio_metrics['total_beta'] < 0.8 else "orange"
         st.metric("Portfolio Beta", f"{portfolio_metrics['total_beta']:.2f}", 
-                 help="Measures sensitivity to market movements", 
-                 delta_color="off")
+                 help="Measures sensitivity to market movements")
     with col3:
         st.metric("Avg P/E Ratio", f"{portfolio_metrics['total_pe']:.1f}")
     with col4:
@@ -411,7 +417,8 @@ def main():
     
     with col2:
         st.markdown("### Stock Allocation")
-        weights_df = pd.DataFrame.from_dict(portfolio_metrics['individual_weights'], orient='index', columns=['Weight'])
+        weights_df = pd.DataFrame.from_dict(portfolio_metrics['individual_weights'], 
+                                          orient='index', columns=['Weight'])
         fig = go.Figure(go.Pie(
             labels=weights_df.index,
             values=weights_df['Weight'],
@@ -439,7 +446,8 @@ def main():
     
     selected_ticker = st.selectbox(
         "Select stock for detailed analysis",
-        list(st.session_state.portfolio.keys()),
+        [t for t in st.session_state.portfolio.keys() 
+         if st.session_state.portfolio[t]['data'] is not None],
         format_func=lambda x: f"{x} - {st.session_state.portfolio[x]['data']['info'].get('shortName', '')}"
     )
     
@@ -466,40 +474,35 @@ def main():
         
         # Valuation metrics
         st.markdown("#### Valuation Metrics")
-        col1, col2, col3, col4 = st.columns(4)
-        with col1:
-            pe = info.get('trailingPE', 0)
-            pe_status = "High" if pe > 25 else "Moderate" if pe > 15 else "Low"
-            st.metric("P/E Ratio", f"{pe:.1f}", pe_status)
-        with col2:
-            pb = info.get('priceToBook', 0)
-            pb_status = "High" if pb > 3 else "Moderate" if pb > 1.5 else "Low"
-            st.metric("Price/Book", f"{pb:.2f}", pb_status)
-        with col3:
-            ps = info.get('priceToSalesTrailing12Months', 0)
-            ps_status = "High" if ps > 5 else "Moderate" if ps > 2 else "Low"
-            st.metric("Price/Sales", f"{ps:.2f}", ps_status)
-        with col4:
-            div_yield = info.get('dividendYield', 0)
-            st.metric("Dividend Yield", f"{div_yield:.2%}")
+        cols = st.columns(4)
+        metrics = [
+            ('P/E Ratio', 'trailingPE', None),
+            ('Price/Book', 'priceToBook', None),
+            ('Price/Sales', 'priceToSalesTrailing12Months', None),
+            ('Dividend Yield', 'dividendYield', '{:.2%}'),
+        ]
+        
+        for (col, (name, key, fmt)) in zip(cols, metrics):
+            with col:
+                value = info.get(key, 0)
+                display = fmt.format(value) if fmt else f"{value:.2f}" if isinstance(value, (int, float)) else str(value)
+                st.metric(name, display)
         
         # Financial health metrics
         st.markdown("#### Financial Health")
-        col1, col2, col3, col4 = st.columns(4)
-        with col1:
-            de = info.get('debtToEquity', 0)
-            de_status = "High" if de > 1.5 else "Moderate" if de > 0.5 else "Low"
-            st.metric("Debt/Equity", f"{de:.2f}", de_status)
-        with col2:
-            cr = info.get('currentRatio', 0)
-            cr_status = "Strong" if cr > 2 else "Adequate" if cr > 1 else "Weak"
-            st.metric("Current Ratio", f"{cr:.2f}", cr_status)
-        with col3:
-            roe = info.get('returnOnEquity', 0)
-            st.metric("ROE", f"{roe:.2%}")
-        with col4:
-            profit_margin = info.get('profitMargins', 0)
-            st.metric("Profit Margin", f"{profit_margin:.2%}")
+        cols = st.columns(4)
+        metrics = [
+            ('Debt/Equity', 'debtToEquity', None),
+            ('Current Ratio', 'currentRatio', None),
+            ('ROE', 'returnOnEquity', '{:.2%}'),
+            ('Profit Margin', 'profitMargins', '{:.2%}'),
+        ]
+        
+        for (col, (name, key, fmt)) in zip(cols, metrics):
+            with col:
+                value = info.get(key, 0)
+                display = fmt.format(value) if fmt else f"{value:.2f}" if isinstance(value, (int, float)) else str(value)
+                st.metric(name, display)
         
         # Price chart with technical indicators
         st.markdown("#### Price Analysis")
@@ -511,21 +514,23 @@ def main():
             x=hist.index, y=hist['Close'], 
             name='Price', line=dict(color='#4f8bf9')), row=1, col=1)
         
-        fig.add_trace(go.Scatter(
-            x=hist.index, y=hist['MA_50'], 
-            name='50-Day MA', line=dict(color='#ff7f0e')), row=1, col=1)
+        if 'MA_50' in hist.columns:
+            fig.add_trace(go.Scatter(
+                x=hist.index, y=hist['MA_50'], 
+                name='50-Day MA', line=dict(color='#ff7f0e')), row=1, col=1)
         
-        fig.add_trace(go.Scatter(
-            x=hist.index, y=hist['MA_200'], 
-            name='200-Day MA', line=dict(color='#2ca02c')), row=1, col=1)
+        if 'MA_200' in hist.columns:
+            fig.add_trace(go.Scatter(
+                x=hist.index, y=hist['MA_200'], 
+                name='200-Day MA', line=dict(color='#2ca02c')), row=1, col=1)
         
-        # RSI
-        fig.add_trace(go.Scatter(
-            x=hist.index, y=hist['RSI'], 
-            name='RSI', line=dict(color='#9467bd')), row=2, col=1)
-        
-        fig.add_hline(y=70, line_dash="dot", line_color="red", row=2, col=1)
-        fig.add_hline(y=30, line_dash="dot", line_color="green", row=2, col=1)
+        # RSI if available
+        if 'RSI' in hist.columns:
+            fig.add_trace(go.Scatter(
+                x=hist.index, y=hist['RSI'], 
+                name='RSI', line=dict(color='#9467bd')), row=2, col=1)
+            fig.add_hline(y=70, line_dash="dot", line_color="red", row=2, col=1)
+            fig.add_hline(y=30, line_dash="dot", line_color="green", row=2, col=1)
         
         fig.update_layout(
             height=600,
@@ -536,5 +541,4 @@ def main():
         st.plotly_chart(fig, use_container_width=True)
 
 if __name__ == "__main__":
-    import plotly.express as px  # For color scales
     main()
