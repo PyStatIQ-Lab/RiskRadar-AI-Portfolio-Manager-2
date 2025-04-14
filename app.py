@@ -4,30 +4,17 @@ import pandas as pd
 import numpy as np
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
-import plotly.express as px
-from pypfopt import (
-    EfficientFrontier, 
-    risk_models, 
-    expected_returns,
-    BlackLittermanModel,
-    objective_functions
-)
-from scipy.stats import norm
-from sklearn.cluster import KMeans
-from sklearn.covariance import GraphicalLassoCV
-from tensorflow.keras.models import Sequential
-from tensorflow.keras.layers import LSTM, Dense
+from sklearn.ensemble import IsolationForest
+from sklearn.preprocessing import StandardScaler
 import openpyxl
 import os
+import plotly.express as px
 from datetime import datetime, timedelta
-import seaborn as sns
-import matplotlib.pyplot as plt
-import warnings
-warnings.filterwarnings('ignore')
+import requests  # For optional news API
 
 # Configure page
 st.set_page_config(
-    page_title="Institutional Portfolio Manager",
+    page_title="AI Portfolio Manager Pro+",
     layout="wide",
     page_icon="📊",
     initial_sidebar_state="expanded"
@@ -43,6 +30,8 @@ st.markdown("""
         --danger: #dc3545;
         --warning: #fd7e14;
         --info: #17a2b8;
+        --light: #f8f9fa;
+        --dark: #343a40;
     }
     
     .metric-card {
@@ -51,25 +40,36 @@ st.markdown("""
         padding: 15px;
         box-shadow: 0 2px 5px rgba(0,0,0,0.05);
         margin-bottom: 15px;
+        border-left: 4px solid var(--primary);
     }
     
     .risk-high { color: var(--danger); font-weight: bold; }
     .risk-medium { color: var(--warning); font-weight: bold; }
     .risk-low { color: var(--success); font-weight: bold; }
     
-    .efficient-frontier {
-        border: 1px solid #ddd;
-        border-radius: 8px;
-        padding: 15px;
+    .health-score {
+        font-size: 2.5rem;
+        font-weight: bold;
+        text-align: center;
+        margin: 10px 0;
     }
     
-    .stProgress > div > div > div > div {
-        background-color: var(--primary);
+    .score-excellent { color: var(--success); }
+    .score-good { color: #7CB342; }
+    .score-fair { color: var(--warning); }
+    .score-poor { color: var(--danger); }
+    
+    .news-card {
+        border-left: 4px solid var(--info);
+        padding: 10px 15px;
+        margin-bottom: 10px;
+        background: white;
+        border-radius: 5px;
     }
 </style>
 """, unsafe_allow_html=True)
 
-# Helper Functions
+# Helper functions
 def load_stock_list(file_path="stocks.xlsx"):
     """Load stock symbols from Excel file"""
     try:
@@ -87,7 +87,7 @@ def get_stock_data(ticker):
     try:
         stock = yf.Ticker(ticker)
         info = stock.info
-        hist = stock.history(period="2y")
+        hist = stock.history(period="1y")
         hist_3mo = stock.history(period="3mo")
         
         if hist.empty:
@@ -107,334 +107,453 @@ def get_stock_data(ticker):
         st.error(f"Error fetching data for {ticker}: {str(e)}")
         return None
 
-# 1. Value-at-Risk Calculation
-def calculate_var(returns, confidence_level=0.95):
-    """Calculate Value-at-Risk using historical method"""
-    if len(returns) < 10:
-        return np.nan
-    return np.percentile(returns, 100 * (1 - confidence_level))
+def calculate_technical_indicators(df):
+    """Calculate technical indicators from historical data"""
+    if df.empty:
+        return df
+        
+    # Moving Averages
+    df['MA_50'] = df['Close'].rolling(window=50, min_periods=1).mean()
+    df['MA_200'] = df['Close'].rolling(window=200, min_periods=1).mean()
+    
+    # RSI
+    if len(df) >= 14:
+        delta = df['Close'].diff()
+        gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
+        loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
+        rs = gain / loss
+        df['RSI'] = 100 - (100 / (1 + rs))
+    else:
+        df['RSI'] = np.nan
+    
+    # Bollinger Bands
+    df['MA_20'] = df['Close'].rolling(window=20).mean()
+    df['Upper_Band'] = df['MA_20'] + (2 * df['Close'].rolling(window=20).std())
+    df['Lower_Band'] = df['MA_20'] - (2 * df['Close'].rolling(window=20).std())
+    
+    return df
 
-# 2. Expected Shortfall (CVaR)
-def calculate_cvar(returns, confidence_level=0.95):
-    """Calculate Conditional Value-at-Risk"""
-    var = calculate_var(returns, confidence_level)
-    return returns[returns <= var].mean()
+def calculate_portfolio_metrics(portfolio):
+    """Calculate portfolio-level metrics"""
+    metrics = {
+        'total_value': 0,
+        'total_beta': 0,
+        'total_pe': 0,
+        'total_debt_to_equity': 0,
+        'total_roe': 0,
+        'sector_exposure': {},
+        'correlation_matrix': None,
+        'individual_weights': {},
+        'volatility_metrics': {},
+        'health_score': 0
+    }
+    
+    close_prices = pd.DataFrame()
+    total_value = sum([h['value'] for h in portfolio.values() if h['data'] is not None])
+    
+    for ticker, holding in portfolio.items():
+        if holding['data'] is None:
+            continue
+            
+        weight = holding['value'] / total_value if total_value > 0 else 0
+        metrics['individual_weights'][ticker] = weight
+        
+        # Aggregate portfolio metrics (weighted)
+        info = holding['data']['info']
+        metrics['total_beta'] += info.get('beta', 0) * weight
+        metrics['total_pe'] += info.get('trailingPE', 0) * weight
+        metrics['total_debt_to_equity'] += info.get('debtToEquity', 0) * weight
+        metrics['total_roe'] += info.get('returnOnEquity', 0) * weight
+        
+        # Track sector exposure
+        sector = info.get('sector', 'Unknown')
+        metrics['sector_exposure'][sector] = metrics['sector_exposure'].get(sector, 0) + weight
+        
+        # Add to correlation matrix
+        close_prices[ticker] = holding['data']['history']['Close']
+        
+        # Volatility metrics
+        metrics['volatility_metrics'][ticker] = {
+            'daily': info.get('daily_volatility', 0),
+            'weekly': info.get('weekly_volatility', 0),
+            'monthly': info.get('monthly_volatility', 0)
+        }
+    
+    metrics['total_value'] = total_value
+    
+    # Calculate correlation matrix
+    if not close_prices.empty:
+        metrics['correlation_matrix'] = close_prices.corr()
+    
+    # Calculate portfolio health score (0-100)
+    health_score = 100
+    # Deduct for high beta
+    if metrics['total_beta'] > 1.2: health_score -= 15
+    elif metrics['total_beta'] < 0.8: health_score -= 5
+    # Deduct for high P/E
+    if metrics['total_pe'] > 25: health_score -= 10
+    # Deduct for sector concentration
+    if len(metrics['sector_exposure']) < 3: health_score -= 10
+    # Deduct for high correlation
+    if metrics['correlation_matrix'] is not None:
+        avg_corr = metrics['correlation_matrix'].values.mean()
+        if avg_corr > 0.7: health_score -= 10
+    metrics['health_score'] = max(0, health_score)
+    
+    return metrics
 
-# 3. Stress Testing
-def apply_stress_test(prices, scenario):
-    """Apply stress test scenario to portfolio"""
-    if scenario == "2008 Crisis":
-        return prices * 0.6  # 40% drop
-    elif scenario == "COVID-19":
-        return prices * 0.7  # 30% drop
-    else:  # User-defined
-        return prices * (1 - scenario)
-
-# 4. Factor Risk Analysis
-def calculate_factor_exposures(returns, factors):
-    """Calculate factor exposures using linear regression"""
-    X = sm.add_constant(factors)
-    model = sm.OLS(returns, X).fit()
-    return model.params[1:]  # Exclude intercept
-
-# 5. Liquidity Risk Metrics
-def calculate_liquidity_metrics(hist_data):
-    """Calculate bid-ask spread and volume metrics"""
+def generate_ai_insights(portfolio, portfolio_metrics):
+    """Generate AI-powered insights based on the data"""
+    insights = []
+    warnings = []
+    suggestions = []
+    report_cards = {}
+    
+    # Portfolio-level insights
+    if portfolio_metrics['total_beta'] > 1.2:
+        insights.append("🔴 Your portfolio has higher-than-market risk (Beta = {:.2f}). Consider adding defensive stocks.".format(portfolio_metrics['total_beta']))
+    elif portfolio_metrics['total_beta'] < 0.8:
+        insights.append("🟢 Your portfolio has lower-than-market risk (Beta = {:.2f}). You may be under-exposed to market upside.".format(portfolio_metrics['total_beta']))
+    
+    if portfolio_metrics['total_pe'] > 25:
+        warnings.append("⚠️ Portfolio appears overvalued (Avg P/E = {:.1f}). Look for value opportunities.".format(portfolio_metrics['total_pe']))
+    
+    # Sector concentration warning
+    if len(portfolio_metrics['sector_exposure']) < 3:
+        main_sector = max(portfolio_metrics['sector_exposure'], key=portfolio_metrics['sector_exposure'].get)
+        warnings.append(f"⚠️ High concentration in {main_sector} sector ({portfolio_metrics['sector_exposure'][main_sector]*100:.0f}%). Consider diversifying.")
+    
+    # Stock-specific analysis
+    for ticker, holding in portfolio.items():
+        if holding['data'] is None:
+            warnings.append(f"⚠️ Could not fetch data for {ticker}")
+            continue
+            
+        info = holding['data']['info']
+        hist = holding['data']['history']
+        report_card = {
+            'valuation': {},
+            'profitability': {},
+            'risk': {},
+            'financial_health': {},
+            'cash_flow': {},
+            'dividends': {},
+            'technical': {}
+        }
+        
+        # Valuation Metrics
+        pe = info.get('trailingPE', 0)
+        report_card['valuation']['P/E'] = {'value': pe, 'status': 'high' if pe > 25 else 'medium' if pe > 15 else 'low'}
+        
+        pb = info.get('priceToBook', 0)
+        report_card['valuation']['P/B'] = {'value': pb, 'status': 'high' if pb > 3 else 'medium' if pb > 1.5 else 'low'}
+        
+        ps = info.get('priceToSalesTrailing12Months', 0)
+        report_card['valuation']['P/S'] = {'value': ps, 'status': 'high' if ps > 5 else 'medium' if ps > 2 else 'low'}
+        
+        # Profitability Metrics
+        roe = info.get('returnOnEquity', 0)
+        report_card['profitability']['ROE'] = {'value': roe, 'status': 'high' if roe > 0.15 else 'medium' if roe > 0.1 else 'low'}
+        
+        profit_margin = info.get('profitMargins', 0)
+        report_card['profitability']['Profit Margin'] = {'value': profit_margin, 'status': 'high' if profit_margin > 0.15 else 'medium' if profit_margin > 0.1 else 'low'}
+        
+        # Risk Metrics
+        beta = info.get('beta', 0)
+        report_card['risk']['Beta'] = {'value': beta, 'status': 'high' if beta > 1.2 else 'low' if beta < 0.8 else 'medium'}
+        
+        volatility = info.get('daily_volatility', 0)
+        report_card['risk']['Volatility'] = {'value': volatility, 'status': 'high' if volatility > 0.3 else 'medium' if volatility > 0.2 else 'low'}
+        
+        # Financial Health
+        de = info.get('debtToEquity', 0)
+        report_card['financial_health']['Debt/Equity'] = {'value': de, 'status': 'high' if de > 1.5 else 'medium' if de > 0.5 else 'low'}
+        
+        current_ratio = info.get('currentRatio', 0)
+        report_card['financial_health']['Current Ratio'] = {'value': current_ratio, 'status': 'high' if current_ratio > 2 else 'medium' if current_ratio > 1 else 'low'}
+        
+        # Cash Flow & Earnings
+        fcf = info.get('freeCashflow', 0)
+        report_card['cash_flow']['Free Cash Flow'] = {'value': fcf, 'status': 'high' if fcf > 1e9 else 'medium' if fcf > 5e8 else 'low'}
+        
+        # Dividends
+        div_yield = info.get('dividendYield', 0)
+        report_card['dividends']['Dividend Yield'] = {'value': div_yield, 'status': 'high' if div_yield > 0.04 else 'medium' if div_yield > 0.02 else 'low'}
+        
+        # Technical Analysis
+        if 'RSI' in hist.columns and not pd.isna(hist['RSI'].iloc[-1]):
+            last_rsi = hist['RSI'].iloc[-1]
+            report_card['technical']['RSI'] = {'value': last_rsi, 'status': 'high' if last_rsi > 70 else 'low' if last_rsi < 30 else 'medium'}
+        
+        report_cards[ticker] = report_card
+        
+        # Generate warnings and suggestions based on report card
+        if pe > 30 and pe > info.get('industryPE', 100):
+            warnings.append(f"⚠️ {ticker}: High P/E ratio ({pe:.1f}) compared to industry")
+        
+        if de > 1.5:
+            warnings.append(f"⚠️ {ticker}: High debt-to-equity ratio ({de:.2f})")
+        
+        if 'RSI' in report_card['technical'] and report_card['technical']['RSI']['status'] == 'high':
+            warnings.append(f"⚠️ {ticker}: Overbought (RSI = {report_card['technical']['RSI']['value']:.1f}) - Consider profit booking")
+        
+        if 'MA_50' in hist.columns and 'MA_200' in hist.columns:
+            if len(hist) >= 2:
+                if hist['MA_50'].iloc[-1] < hist['MA_200'].iloc[-1] and hist['MA_50'].iloc[-2] >= hist['MA_200'].iloc[-2]:
+                    suggestions.append(f"🔴 Consider exiting {ticker} - Death Cross detected (50MA crossed below 200MA)")
+    
     return {
-        'avg_spread': (hist_data['High'] - hist_data['Low']).mean(),
-        'volume_concentration': hist_data['Volume'].std() / hist_data['Volume'].mean()
+        'insights': insights,
+        'warnings': warnings,
+        'suggestions': suggestions,
+        'report_cards': report_cards
     }
 
-# 6. Concentration Risk
-def calculate_concentration_risk(weights):
-    """Calculate Herfindahl-Hirschman Index"""
-    return np.sum(weights**2) * 10000
+def get_news_sentiment(ticker):
+    """Optional: Get news sentiment for a stock"""
+    # This is a placeholder - you would integrate with a news API
+    return {
+        'sentiment': 'neutral',
+        'summary': 'No major news events recently'
+    }
 
-# 7. Mean-Variance Optimization
-def mean_variance_optimization(prices, risk_free_rate=0.02):
-    """Perform mean-variance optimization"""
-    mu = expected_returns.mean_historical_return(prices)
-    S = risk_models.sample_cov(prices)
-    ef = EfficientFrontier(mu, S)
-    ef.max_sharpe(risk_free_rate)
-    weights = ef.clean_weights()
-    return weights
-
-# 8. Black-Litterman Model
-def black_litterman_optimization(prices, market_caps, views=None, view_confidences=None):
-    """Black-Litterman model optimization"""
-    if views is None:
-        views = {}
-    if view_confidences is None:
-        view_confidences = {}
-    
-    mcaps = {k: v for k, v in zip(prices.columns, market_caps)}
-    S = risk_models.CovarianceShrinkage(prices).ledoit_wolf()
-    bl = BlackLittermanModel(S, pi="market", market_caps=mcaps)
-    bl.set_views(views, view_confidences)
-    rets = bl.bl_returns()
-    ef = EfficientFrontier(rets, S)
-    ef.max_sharpe()
-    return ef.clean_weights()
-
-# 9. Risk Parity Allocation
-def risk_parity_allocation(prices):
-    """Risk parity portfolio optimization"""
-    S = risk_models.CovarianceShrinkage(prices).ledoit_wolf()
-    ef = EfficientFrontier(None, S)
-    ef.add_objective(objective_functions.risk_parity)
-    ef.min_volatility()
-    return ef.clean_weights()
-
-# 10. Hierarchical Risk Parity
-def hierarchical_risk_parity(prices):
-    """Hierarchical Risk Parity allocation"""
-    from scipy.cluster.hierarchy import linkage, leaves_list
-    from scipy.spatial.distance import pdist, squareform
-    
-    returns = prices.pct_change().dropna()
-    corr = returns.corr()
-    dist = np.sqrt(2 * (1 - corr))
-    link = linkage(dist, 'single')
-    sort_idx = leaves_list(link)
-    ordered_corr = corr.iloc[sort_idx, sort_idx]
-    
-    # HRP allocation logic here
-    # (Implementation would continue with recursive bisection)
-    
-    # Placeholder equal weights for demo
-    return {ticker: 1/len(prices.columns) for ticker in prices.columns}
-
-# Main App
+# Main app
 def main():
     # Initialize session state
     if 'portfolio' not in st.session_state:
         st.session_state.portfolio = {}
     
-    # Load stock list
+    # Load stock list from Excel
     stock_list = load_stock_list()
     
-    # Sidebar
+    # Sidebar for user input
     with st.sidebar:
+        st.image("https://via.placeholder.com/200x50?text=Portfolio+Pro", use_column_width=True)
         st.header("Portfolio Setup")
-        selected_stock = st.selectbox("Select Stock", stock_list)
-        quantity = st.number_input("Quantity", min_value=1, value=100)
         
-        if st.button("Add to Portfolio"):
-            with st.spinner(f"Loading {selected_stock}..."):
-                data = get_stock_data(selected_stock)
-                if data:
-                    price = data['info'].get('currentPrice', 0)
-                    st.session_state.portfolio[selected_stock] = {
-                        'quantity': quantity,
-                        'value': quantity * price,
-                        'data': data
-                    }
-    
-    # Main Dashboard
-    st.title("Institutional Portfolio Manager")
+        # Stock selection and quantity input
+        if stock_list:
+            selected_stock = st.selectbox("Select Stock", stock_list)
+            quantity = st.number_input("Quantity", min_value=1, value=100)
+            
+            if st.button("Add to Portfolio"):
+                with st.spinner(f"Fetching data for {selected_stock}..."):
+                    stock_data = get_stock_data(selected_stock)
+                    if stock_data:
+                        current_price = stock_data['info'].get('currentPrice', stock_data['info'].get('regularMarketPrice', 0))
+                        value = current_price * quantity
+                        st.session_state.portfolio[selected_stock] = {
+                            'quantity': quantity,
+                            'value': value,
+                            'data': stock_data
+                        }
+                        st.success(f"Added {quantity} shares of {selected_stock} to portfolio")
+                    else:
+                        st.error(f"Failed to fetch data for {selected_stock}")
+        
+        # Portfolio summary in sidebar
+        if st.session_state.portfolio:
+            st.subheader("Your Portfolio")
+            total_value = sum([h['value'] for h in st.session_state.portfolio.values() if h['data'] is not None])
+            st.metric("Total Value", f"₹{total_value:,.2f}" if total_value > 0 else "₹0")
+            
+            for ticker, holding in st.session_state.portfolio.items():
+                if holding['data'] is not None:
+                    st.markdown(f"**{ticker}**: {holding['quantity']} shares (₹{holding['value']:,.2f})")
+
+    # Main content area
+    st.title("📊 AI Portfolio Manager Pro+")
+    st.caption("Advanced portfolio analysis with comprehensive risk assessment")
     
     if not st.session_state.portfolio:
-        st.info("Add stocks to begin analysis")
+        st.info("💡 Add stocks to your portfolio using the sidebar to begin analysis")
         return
     
-    # Prepare data
-    tickers = list(st.session_state.portfolio.keys())
-    prices = pd.DataFrame({
-        t: st.session_state.portfolio[t]['data']['history']['Close'] 
-        for t in tickers
-    }).dropna()
-    returns = prices.pct_change().dropna()
-    weights = np.array([st.session_state.portfolio[t]['value'] for t in tickers])
-    weights = weights / weights.sum()
+    # Calculate portfolio metrics
+    with st.spinner("Analyzing your portfolio..."):
+        portfolio_metrics = calculate_portfolio_metrics(st.session_state.portfolio)
+        ai_output = generate_ai_insights(st.session_state.portfolio, portfolio_metrics)
     
-    # Risk Analytics Section
-    st.header("Advanced Risk Analytics")
+    # Portfolio Health Score
+    st.subheader("🏆 Portfolio Health Score", divider="blue")
+    health_score = portfolio_metrics['health_score']
+    score_class = "score-excellent" if health_score >= 85 else "score-good" if health_score >= 70 else "score-fair" if health_score >= 50 else "score-poor"
+    st.markdown(f"<div class='health-score {score_class}'>{health_score:.0f}/100</div>", unsafe_allow_html=True)
     
-    # 1. VaR Calculation
-    with st.expander("1. Value-at-Risk (VaR) Analysis"):
-        col1, col2 = st.columns(2)
-        with col1:
-            conf_level = st.slider("Confidence Level", 0.90, 0.99, 0.95, 0.01)
+    cols = st.columns(3)
+    with cols[0]:
+        st.metric("Diversification", "Good" if len(portfolio_metrics['sector_exposure']) >= 3 else "Needs Improvement")
+    with cols[1]:
+        st.metric("Risk Profile", "Aggressive" if portfolio_metrics['total_beta'] > 1.2 else "Defensive" if portfolio_metrics['total_beta'] < 0.8 else "Moderate")
+    with cols[2]:
+        st.metric("Valuation", "Overvalued" if portfolio_metrics['total_pe'] > 25 else "Undervalued" if portfolio_metrics['total_pe'] < 15 else "Fair")
+    
+    # Risk Analysis Section
+    st.subheader("⚠️ Risk Analysis", divider="blue")
+    
+    if ai_output['warnings']:
+        st.warning("### Immediate Risk Warnings")
+        for warning in ai_output['warnings']:
+            st.write(f"- {warning}")
+    else:
+        st.success("No critical risk warnings detected")
+    
+    # AI Insights Section
+    st.subheader("🤖 AI Insights", divider="blue")
+    
+    if ai_output['insights'] or ai_output['suggestions']:
+        tab1, tab2 = st.tabs(["Market Insights", "Actionable Suggestions"])
         
-        var_results = {}
-        for t in tickers:
-            var_results[t] = calculate_var(returns[t], conf_level)
+        with tab1:
+            for insight in ai_output['insights']:
+                st.info(insight)
         
-        fig = go.Figure()
-        for t, var in var_results.items():
-            fig.add_trace(go.Bar(
-                x=[t],
-                y=[-var*100],
-                name=f"{t} VaR"
+        with tab2:
+            for suggestion in ai_output['suggestions']:
+                st.success(suggestion)
+    else:
+        st.info("No specific insights or suggestions at this time")
+    
+    # Portfolio Composition
+    st.subheader("🧩 Portfolio Composition", divider="blue")
+    
+    col1, col2 = st.columns(2)
+    
+    with col1:
+        st.markdown("### Sector Exposure")
+        if portfolio_metrics['sector_exposure']:
+            fig = go.Figure(go.Pie(
+                labels=list(portfolio_metrics['sector_exposure'].keys()),
+                values=list(portfolio_metrics['sector_exposure'].values()),
+                hole=0.3,
+                marker_colors=px.colors.qualitative.Pastel
             ))
-        fig.update_layout(
-            title=f"Value-at-Risk at {conf_level*100:.0f}% Confidence",
-            yaxis_title="VaR (%)",
-            barmode="group"
-        )
+            fig.update_layout(height=400)
+            st.plotly_chart(fig, use_container_width=True)
+    
+    with col2:
+        st.markdown("### Stock Allocation")
+        weights_df = pd.DataFrame.from_dict(portfolio_metrics['individual_weights'], 
+                                          orient='index', columns=['Weight'])
+        fig = go.Figure(go.Pie(
+            labels=weights_df.index,
+            values=weights_df['Weight'],
+            hole=0.3,
+            marker_colors=px.colors.qualitative.Set3
+        ))
+        fig.update_layout(height=400)
         st.plotly_chart(fig, use_container_width=True)
     
-    # 2. Expected Shortfall
-    with st.expander("2. Expected Shortfall (CVaR)"):
-        cvar_results = {}
-        for t in tickers:
-            cvar_results[t] = calculate_cvar(returns[t], conf_level)
-        
-        fig = go.Figure()
-        for t, cvar in cvar_results.items():
-            fig.add_trace(go.Bar(
-                x=[t],
-                y=[-cvar*100],
-                name=f"{t} CVaR"
-            ))
-        fig.update_layout(
-            title=f"Conditional VaR at {conf_level*100:.0f}% Confidence",
-            yaxis_title="CVaR (%)",
-            barmode="group"
-        )
-        st.plotly_chart(fig, use_container_width=True)
+    # Stock Report Cards
+    st.subheader("📋 Stock Report Cards", divider="blue")
     
-    # 3. Stress Testing
-    with st.expander("3. Stress Testing"):
-        scenario = st.selectbox(
-            "Select Stress Scenario",
-            ["2008 Crisis", "COVID-19", "Custom Shock"]
-        )
-        
-        if scenario == "Custom Shock":
-            shock = st.slider("Custom Shock Percentage", 1, 90, 20) / 100
-        else:
-            shock = None
-        
-        stressed_prices = apply_stress_test(prices, shock if scenario == "Custom Shock" else scenario)
-        stressed_returns = stressed_prices.pct_change().dropna()
-        
-        col1, col2 = st.columns(2)
-        with col1:
-            st.metric("Portfolio Value Change", 
-                     f"{(stressed_prices.iloc[-1].dot(weights) / prices.iloc[-1].dot(weights) - 1:.1%}")
-        with col2:
-            st.metric("Max Drawdown", 
-                     f"{stressed_returns.min().min()*100:.1f}%")
-    
-    # Portfolio Optimization Section
-    st.header("Portfolio Optimization")
-    
-    # 7. Mean-Variance Optimization
-    with st.expander("7. Mean-Variance Optimization"):
-        risk_free = st.number_input("Risk-Free Rate", 0.0, 0.2, 0.02, 0.01)
-        
-        try:
-            opt_weights = mean_variance_optimization(prices, risk_free)
-            fig = go.Figure()
-            fig.add_trace(go.Bar(
-                x=list(opt_weights.keys()),
-                y=list(opt_weights.values()),
-                name="Optimal Weights"
-            ))
-            fig.update_layout(
-                title="Mean-Variance Optimal Weights",
-                yaxis_title="Weight (%)"
-            )
-            st.plotly_chart(fig, use_container_width=True)
+    for ticker, report_card in ai_output['report_cards'].items():
+        with st.expander(f"📌 {ticker} - Detailed Analysis"):
+            tabs = st.tabs(["Valuation", "Profitability", "Risk", "Financial Health", "Cash Flow", "Dividends", "Technical"])
             
-            # Show efficient frontier
-            mu = expected_returns.mean_historical_return(prices)
-            S = risk_models.sample_cov(prices)
-            ef = EfficientFrontier(mu, S)
-            fig = go.Figure()
+            with tabs[0]:
+                st.markdown("#### Valuation Metrics")
+                cols = st.columns(3)
+                for i, (metric, data) in enumerate(report_card['valuation'].items()):
+                    with cols[i % 3]:
+                        st.metric(
+                            metric,
+                            f"{data['value']:.2f}",
+                            data['status'].capitalize(),
+                            delta_color="inverse" if data['status'] == 'high' else "off"
+                        )
             
-            # Generate random portfolios
-            n_samples = 1000
-            random_weights = np.random.dirichlet(np.ones(len(mu)), n_samples)
-            random_returns = random_weights.dot(mu)
-            random_volatility = np.array([np.sqrt(w.T @ S @ w) for w in random_weights])
+            with tabs[1]:
+                st.markdown("#### Profitability Metrics")
+                cols = st.columns(3)
+                for i, (metric, data) in enumerate(report_card['profitability'].items()):
+                    with cols[i % 3]:
+                        st.metric(
+                            metric,
+                            f"{data['value']:.2%}",
+                            data['status'].capitalize()
+                        )
             
-            fig.add_trace(go.Scatter(
-                x=random_volatility,
-                y=random_returns,
-                mode='markers',
-                name='Random Portfolios',
-                marker=dict(color='blue', opacity=0.5)
-            ))
+            with tabs[2]:
+                st.markdown("#### Risk Metrics")
+                cols = st.columns(3)
+                for i, (metric, data) in enumerate(report_card['risk'].items()):
+                    with cols[i % 3]:
+                        st.metric(
+                            metric,
+                            f"{data['value']:.2f}",
+                            data['status'].capitalize(),
+                            delta_color="inverse" if data['status'] == 'high' else "off"
+                        )
             
-            # Plot efficient frontier
-            ret_range = np.linspace(random_returns.min(), random_returns.max(), 50)
-            efficient_portfolios = []
-            for ret in ret_range:
-                ef = EfficientFrontier(mu, S)
-                ef.efficient_return(ret)
-                w = ef.clean_weights()
-                vol = np.sqrt(ef.portfolio_performance()[1])
-                efficient_portfolios.append((ret, vol))
+            with tabs[3]:
+                st.markdown("#### Financial Health")
+                cols = st.columns(3)
+                for i, (metric, data) in enumerate(report_card['financial_health'].items()):
+                    with cols[i % 3]:
+                        st.metric(
+                            metric,
+                            f"{data['value']:.2f}",
+                            data['status'].capitalize(),
+                            delta_color="inverse" if metric == 'Debt/Equity' and data['status'] == 'high' else "normal"
+                        )
             
-            eff_rets, eff_vols = zip(*efficient_portfolios)
-            fig.add_trace(go.Scatter(
-                x=eff_vols,
-                y=eff_rets,
-                mode='lines',
-                name='Efficient Frontier',
-                line=dict(color='red', width=2)
-            ))
+            with tabs[4]:
+                st.markdown("#### Cash Flow & Earnings")
+                cols = st.columns(3)
+                for i, (metric, data) in enumerate(report_card['cash_flow'].items()):
+                    with cols[i % 3]:
+                        st.metric(
+                            metric,
+                            f"₹{data['value']/1e6:,.1f}M" if data['value'] > 1e6 else f"₹{data['value']:,.0f}",
+                            data['status'].capitalize()
+                        )
             
-            fig.update_layout(
-                title="Efficient Frontier",
-                xaxis_title="Volatility",
-                yaxis_title="Return"
-            )
-            st.plotly_chart(fig, use_container_width=True)
+            with tabs[5]:
+                st.markdown("#### Dividend Metrics")
+                cols = st.columns(3)
+                for i, (metric, data) in enumerate(report_card['dividends'].items()):
+                    with cols[i % 3]:
+                        st.metric(
+                            metric,
+                            f"{data['value']:.2%}",
+                            data['status'].capitalize()
+                        )
             
-        except Exception as e:
-            st.error(f"Optimization failed: {str(e)}")
-    
-    # 8. Black-Litterman Model
-    with st.expander("8. Black-Litterman Model"):
-        st.info("Configure your market views:")
-        views = {}
-        view_confidences = {}
-        
-        for t in tickers:
-            col1, col2 = st.columns(2)
-            with col1:
-                view = st.number_input(f"Expected return for {t}", -0.5, 0.5, 0.1, 0.01)
-            with col2:
-                confidence = st.slider(f"Confidence for {t}", 0.1, 1.0, 0.7, 0.1)
-            views[t] = view
-            view_confidences[t] = confidence
-        
-        if st.button("Run Black-Litterman Optimization"):
-            try:
-                # Use market caps as proxy for equilibrium weights
-                market_caps = [st.session_state.portfolio[t]['data']['info'].get('marketCap', 1e9) 
-                              for t in tickers]
-                bl_weights = black_litterman_optimization(prices, market_caps, views, view_confidences)
+            with tabs[6]:
+                st.markdown("#### Technical Analysis")
+                if report_card['technical']:
+                    cols = st.columns(3)
+                    for i, (metric, data) in enumerate(report_card['technical'].items()):
+                        with cols[i % 3]:
+                            st.metric(
+                                metric,
+                                f"{data['value']:.1f}",
+                                data['status'].capitalize(),
+                                delta_color="inverse" if data['status'] == 'high' else "normal"
+                            )
+                else:
+                    st.info("No technical indicators available")
                 
+                # Price chart
+                hist = st.session_state.portfolio[ticker]['data']['history']
                 fig = go.Figure()
-                fig.add_trace(go.Bar(
-                    x=list(bl_weights.keys()),
-                    y=list(bl_weights.values()),
-                    name="BL Weights"
-                ))
-                fig.update_layout(
-                    title="Black-Litterman Optimal Weights",
-                    yaxis_title="Weight (%)"
-                )
+                fig.add_trace(go.Scatter(x=hist.index, y=hist['Close'], name='Price'))
+                if 'MA_50' in hist.columns:
+                    fig.add_trace(go.Scatter(x=hist.index, y=hist['MA_50'], name='50-Day MA'))
+                if 'MA_200' in hist.columns:
+                    fig.add_trace(go.Scatter(x=hist.index, y=hist['MA_200'], name='200-Day MA'))
+                if 'Upper_Band' in hist.columns and 'Lower_Band' in hist.columns:
+                    fig.add_trace(go.Scatter(x=hist.index, y=hist['Upper_Band'], name='Upper Bollinger Band', line=dict(color='rgba(255,0,0,0.3)')))
+                    fig.add_trace(go.Scatter(x=hist.index, y=hist['Lower_Band'], name='Lower Bollinger Band', line=dict(color='rgba(0,255,0,0.3)', fill='tonexty')))
+                fig.update_layout(height=300)
                 st.plotly_chart(fig, use_container_width=True)
-            except Exception as e:
-                st.error(f"Optimization failed: {str(e)}")
-    
-    # Additional sections would continue with implementations for:
-    # 4. Factor Risk Analysis
-    # 5. Liquidity Risk Metrics
-    # 6. Concentration Risk
-    # 9. Risk Parity Allocation
-    # 10. Hierarchical Risk Parity
-    # ... and all remaining features
-    
-    # Note: Full implementation would include all 20 features with similar detailed implementations
-    # This example shows the pattern for implementing the remaining features
+            
+            # Optional News Sentiment
+            if st.checkbox("Show News Sentiment (Simulated)", key=f"news_{ticker}"):
+                sentiment = get_news_sentiment(ticker)
+                st.markdown(f"**Sentiment**: {sentiment['sentiment'].capitalize()}")
+                st.markdown(f"**Summary**: {sentiment['summary']}")
 
 if __name__ == "__main__":
-    import statsmodels.api as sm  # For factor analysis
     main()
