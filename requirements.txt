@@ -10,3 +10,4 @@ openpyxl
 statsmodels
 cvxpy
 networkx
+tensorflow
